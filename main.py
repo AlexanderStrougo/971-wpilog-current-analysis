@@ -1133,6 +1133,239 @@ def generate_battery_report(
     plt.close(fig)
     saved["current_voltage_correlation"] = file_path
 
+    # 6) Battery parameter estimation reused by the analyses below.
+    i_total = np.sum(currents, axis=0)
+    v_oc = float(np.percentile(v, 99))
+    v_drop = np.clip(v_oc - v, 0.0, None)
+    i_energy = float(np.dot(i_total, i_total))
+    if i_energy <= 1e-9:
+        r_int = 0.02
+    else:
+        r_int = float(np.dot(i_total, v_drop) / i_energy)
+    r_int = float(np.clip(r_int, 0.005, 0.1))
+    i_max = float((v_oc - threshold) / r_int) if r_int > 0.0 else 0.0
+
+    # 7) Slack analysis timeseries and distribution.
+    slack = i_max - i_total
+    brownout_rate = float(np.mean(slack < 0.0)) if slack.size else 0.0
+    mean_slack = float(np.mean(slack)) if slack.size else 0.0
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        figsize=(11.0, 7.0),
+        constrained_layout=True,
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.0, 1.2]},
+    )
+    ax_top.plot(t, slack, color="#1f2937", linewidth=1.4)
+    ax_top.fill_between(t, slack, 0.0, where=slack >= 0.0, color="#22c55e", alpha=0.35, interpolate=True)
+    ax_top.fill_between(t, slack, 0.0, where=slack < 0.0, color="#ef4444", alpha=0.35, interpolate=True)
+    ax_top.axhline(0.0, color="black", linestyle="--", linewidth=1.1)
+    ax_top.set_ylabel("Current Headroom (A)")
+    ax_top.grid(True, linestyle="--", alpha=0.3)
+
+    ax_bottom.hist(slack, bins=50, color="#64748b", alpha=0.82, edgecolor="white")
+    ax_bottom.set_ylabel("Density / Count")
+    ax_bottom.set_xlabel("Time (s)")
+    ax_bottom.grid(True, linestyle="--", alpha=0.25)
+    ax_bottom.text(
+        0.98,
+        0.95,
+        f"Mean slack: {mean_slack:.1f} A\nBrownout rate: {brownout_rate * 100.0:.1f}%",
+        transform=ax_bottom.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "#cbd5e1"},
+    )
+    fig.suptitle("Current Slack vs. I_max")
+    file_path = output_path / "slack_analysis.png"
+    fig.savefig(file_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    saved["slack_analysis"] = file_path
+
+    # 8) Brownout contribution vectors and clustering.
+    contribution_vectors: list[np.ndarray] = []
+    for start_idx, end_idx in events:
+        if end_idx <= start_idx:
+            continue
+        peak_local = int(np.argmax(i_total[start_idx:end_idx]))
+        peak_idx = start_idx + peak_local
+        contribution_vectors.append(currents[:, peak_idx].astype(float, copy=True))
+
+    event_count = len(contribution_vectors)
+    if event_count < 2:
+        fig, ax = plt.subplots(figsize=(10.0, 3.8), constrained_layout=True)
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            f"Insufficient brownout events for clustering (found {event_count}).",
+            ha="center",
+            va="center",
+            fontsize=13,
+        )
+    else:
+        vectors = np.vstack(contribution_vectors)
+        fallback_mode = False
+        k = min(3, event_count)
+        try:
+            from sklearn.cluster import KMeans
+
+            model = KMeans(n_clusters=k, n_init=10, random_state=42)
+            labels = model.fit_predict(vectors)
+            centroids = model.cluster_centers_
+        except ImportError:
+            fallback_mode = True
+            k = 1
+            labels = np.zeros(event_count, dtype=int)
+            centroids = np.mean(vectors, axis=0, keepdims=True)
+
+        cluster_sizes = np.array([int(np.sum(labels == idx)) for idx in range(k)], dtype=int)
+        centroid_sums = np.sum(centroids, axis=1)
+        order = np.argsort(centroid_sums)[::-1]
+        ordered_centroids = centroids[order]
+        ordered_sizes = cluster_sizes[order]
+        ordered_sums = centroid_sums[order]
+
+        fig_height = max(4.2, 1.1 * k + 2.6)
+        fig, ax = plt.subplots(figsize=(12.0, fig_height), constrained_layout=True)
+        y_base = np.arange(k, dtype=float)
+        bar_group_height = 0.78
+        bar_h = bar_group_height / max(len(subsystems), 1)
+        offsets = (np.arange(len(subsystems), dtype=float) - (len(subsystems) - 1) / 2.0) * bar_h
+
+        for subsystem_idx, subsystem in enumerate(subsystems):
+            y = y_base + offsets[subsystem_idx]
+            ax.barh(
+                y,
+                ordered_centroids[:, subsystem_idx],
+                height=bar_h * 0.95,
+                color=colors[subsystem],
+                alpha=0.92,
+                label=subsystem if subsystem_idx == 0 else None,
+            )
+
+        ax.set_yticks(y_base)
+        ax.set_yticklabels([f"Cluster {idx + 1}" for idx in range(k)])
+        ax.set_xlabel("Current at Peak Frame (A)")
+        if fallback_mode:
+            ax.set_title("Brownout Contribution Clusters (KMeans unavailable, fallback mean cluster)")
+        else:
+            ax.set_title(f"Brownout Contribution Clusters (KMeans, k={k})")
+        ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+        x_max = float(np.max(ordered_centroids)) if ordered_centroids.size else 0.0
+        x_offset = max(0.8, x_max * 0.02)
+        for idx in range(k):
+            row_max = float(np.max(ordered_centroids[idx]))
+            ax.text(
+                row_max + x_offset,
+                y_base[idx],
+                f"n={ordered_sizes[idx]}, total={ordered_sums[idx]:.1f} A",
+                va="center",
+                ha="left",
+                fontsize=9,
+            )
+
+        legend_handles = [
+            plt.Rectangle((0, 0), 1, 1, color=colors[subsystem], alpha=0.92) for subsystem in subsystems
+        ]
+        ax.legend(legend_handles, subsystems, loc="best", fontsize=8, framealpha=0.9, ncol=2)
+
+    file_path = output_path / "brownout_clusters.png"
+    fig.savefig(file_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    saved["brownout_clusters"] = file_path
+
+    # 9) Sensitivity analysis and recommended limit reductions.
+    p95 = np.array([float(np.percentile(currents[idx], 95)) for idx in range(len(subsystems))], dtype=float)
+    low_slack_mask = slack < (0.1 * i_max)
+    low_slack_count = int(np.sum(low_slack_mask))
+    sensitivities = np.zeros(len(subsystems), dtype=float)
+    if low_slack_count > 0:
+        for idx in range(len(subsystems)):
+            near_p95 = currents[idx] > (0.9 * p95[idx])
+            sensitivities[idx] = float(np.mean(near_p95[low_slack_mask]))
+
+    recommended_limits = p95.copy()
+    reduction_order = list(np.argsort(sensitivities)[::-1])
+    if float(np.sum(recommended_limits)) > i_max:
+        while float(np.sum(recommended_limits)) > i_max:
+            progressed = False
+            for idx in reduction_order:
+                if recommended_limits[idx] > 5.0:
+                    next_limit = max(5.0, recommended_limits[idx] - 1.0)
+                    if next_limit < recommended_limits[idx]:
+                        recommended_limits[idx] = next_limit
+                        progressed = True
+                        if float(np.sum(recommended_limits)) <= i_max:
+                            break
+            if not progressed:
+                break
+
+    sensitivity_order = np.argsort(sensitivities)[::-1]
+    ordered_subsystems = [subsystems[idx] for idx in sensitivity_order]
+    ordered_sensitivities = sensitivities[sensitivity_order]
+    ordered_p95 = p95[sensitivity_order]
+    ordered_limits = recommended_limits[sensitivity_order]
+
+    fig_height = max(4.6, 0.42 * len(subsystems) + 2.2)
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(14.0, fig_height), constrained_layout=True)
+
+    y_pos = np.arange(len(ordered_subsystems))
+    left_colors = [colors[name] for name in ordered_subsystems]
+    ax_left.barh(y_pos, ordered_sensitivities, color=left_colors, alpha=0.9)
+    ax_left.set_yticks(y_pos)
+    ax_left.set_yticklabels(ordered_subsystems)
+    ax_left.invert_yaxis()
+    ax_left.set_xlim(0.0, 1.0)
+    ax_left.set_xlabel("Sensitivity Score")
+    ax_left.set_title("Low-Slack Sensitivity Rank")
+    ax_left.grid(axis="x", linestyle="--", alpha=0.3)
+
+    bar_h = 0.38
+    ax_right.barh(y_pos - bar_h / 2.0, ordered_p95, height=bar_h, color="#94a3b8", alpha=0.92, label="P95")
+    ax_right.barh(
+        y_pos + bar_h / 2.0,
+        ordered_limits,
+        height=bar_h,
+        color="#0ea5e9",
+        alpha=0.92,
+        label="Recommended",
+    )
+    ax_right.set_yticks(y_pos)
+    ax_right.set_yticklabels(ordered_subsystems)
+    ax_right.invert_yaxis()
+    ax_right.set_xlabel("Current Limit (A)")
+    ax_right.set_title("P95 vs. Recommended Limit")
+    ax_right.grid(axis="x", linestyle="--", alpha=0.3)
+    ax_right.legend(loc="lower right")
+    limit_max = max(float(np.max(ordered_p95)) if ordered_p95.size else 0.0, float(np.max(ordered_limits)) if ordered_limits.size else 0.0)
+    text_dx = max(0.35, limit_max * 0.01)
+    for pos, p95_val, limit_val in zip(y_pos, ordered_p95, ordered_limits):
+        if limit_val < p95_val:
+            delta = p95_val - limit_val
+            ax_right.text(limit_val + text_dx, pos + bar_h / 2.0, f"-{delta:.1f} A", va="center", ha="left", fontsize=9)
+
+    fig.suptitle("Subsystem Sensitivity and Recommended Current Limits")
+    file_path = output_path / "sensitivity_and_limits.png"
+    fig.savefig(file_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    saved["sensitivity_and_limits"] = file_path
+
+    # Plain-text report for quick CLI inspection.
+    print(f"Battery fit: V_oc={v_oc:.3f} V, R_int={r_int:.4f} ohm, I_max={i_max:.2f} A")
+    print(f"Brownout rate: {brownout_rate:.4f}")
+    print("Subsystem | P95 (A) | sensitivity | recommended limit (A) | delta (A)")
+    for idx in sensitivity_order:
+        delta_val = p95[idx] - recommended_limits[idx]
+        print(
+            f"{subsystems[idx]} | {p95[idx]:.2f} | {sensitivities[idx]:.3f} | "
+            f"{recommended_limits[idx]:.2f} | {delta_val:.2f}"
+        )
+
     return saved
 
 
