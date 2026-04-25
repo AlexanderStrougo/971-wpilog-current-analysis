@@ -82,6 +82,13 @@ def bucket_column_names(bucket_count: int) -> list[str]:
     return [f"bucket_{bucket_label(index, bucket_count)}_avg" for index in range(bucket_count)]
 
 
+def duty_cycle_from_buckets(bucket_values: list[float], threshold: float) -> float:
+    finite = [value for value in bucket_values if not math.isnan(value)]
+    if not finite:
+        return math.nan
+    return float(sum(1 for value in finite if value >= threshold) / len(finite))
+
+
 @dataclass
 class WeightedIntervalStats:
     intervals: list[tuple[float, float]] = field(default_factory=list)
@@ -369,12 +376,46 @@ def analyze_log(log_path: Path, bucket_count: int) -> AnalysisResult:
                 "p95": format_number(stats.weighted_percentile(0.95) if has_data else math.nan),
                 "max": format_number(stats.max_value if has_data and stats.total_duration > 0.0 else math.nan),
                 "top_bucket_avg": format_number(buckets[-1]),
+                "frac_above_25pct": format_number(
+                    duty_cycle_from_buckets(buckets, 0.25 * stats.max_value) if has_data else math.nan
+                ),
+                "frac_above_50pct": format_number(
+                    duty_cycle_from_buckets(buckets, 0.50 * stats.max_value) if has_data else math.nan
+                ),
+                "frac_above_75pct": format_number(
+                    duty_cycle_from_buckets(buckets, 0.75 * stats.max_value) if has_data else math.nan
+                ),
+                "frac_above_100pct": format_number(
+                    duty_cycle_from_buckets(buckets, 1.00 * stats.max_value) if has_data else math.nan
+                ),
+                "stator_supply_ratio": "",
+                "mechanically_loaded": "",
                 "bucket_count": str(bucket_count),
                 "member_topics": "; ".join(aggregate.member_topics),
             }
             for column, value in zip(bucket_columns, buckets):
                 row[column] = format_number(value)
             rows.append(row)
+    pair_rows: dict[tuple[str, str], dict[str, dict[str, str]]] = {}
+    for row in rows:
+        if row["metric"] not in CURRENT_SUFFIXES:
+            continue
+        pair_rows.setdefault((row["phase"], row["subsystem"]), {})[row["metric"]] = row
+
+    for pair in pair_rows.values():
+        supply_row = pair.get("Supply Current")
+        stator_row = pair.get("Stator Current")
+        if supply_row is None or stator_row is None:
+            continue
+        supply_avg = float(supply_row.get("average") or "nan")
+        stator_avg = float(stator_row.get("average") or "nan")
+        ratio = math.nan if (math.isnan(supply_avg) or supply_avg <= 1e-9) else (stator_avg / supply_avg)
+        ratio_text = format_number(ratio)
+        loaded_text = "true" if (not math.isnan(ratio) and ratio > 1.5) else "false"
+        supply_row["stator_supply_ratio"] = ratio_text
+        stator_row["stator_supply_ratio"] = ratio_text
+        supply_row["mechanically_loaded"] = loaded_text
+        stator_row["mechanically_loaded"] = loaded_text
     segments: dict[tuple[str, str, str], list[tuple[int, int, float]]] = {}
     for aggregate_name, aggregate in aggregates.items():
         subsystem, metric = aggregate_name.split("|", 1)
@@ -410,6 +451,11 @@ def rows_to_dataframe(rows: list[dict[str, str]], bucket_count: int) -> pd.DataF
         "p95",
         "max",
         "top_bucket_avg",
+        "frac_above_25pct",
+        "frac_above_50pct",
+        "frac_above_75pct",
+        "frac_above_100pct",
+        "stator_supply_ratio",
         "bucket_count",
     ] + bucket_column_names(bucket_count)
     for column in numeric_cols:
@@ -622,20 +668,51 @@ def write_html_report(
     other_rows = df[~df["metric"].isin(CURRENT_SUFFIXES)].copy().sort_values(
         ["average", "phase", "subsystem"], ascending=[False, True, True]
     )
+    recommendations_path = report_dir / "limit_recommendations_supply.csv"
+    recommendations_df = pd.read_csv(recommendations_path) if recommendations_path.exists() else pd.DataFrame()
     battery_figures = [
         ("Subsystem Currents vs Voltage", "battery_current_stacked_vs_voltage.png"),
+        ("Brownout Deficit Stack", "brownout_deficit_stack.png"),
         ("Per-Subsystem Current Histograms", "subsystem_current_histograms.png"),
         ("Brownout Event Isolation", "brownout_event_isolation.png"),
         ("Cumulative Charge by Subsystem", "cumulative_charge_stacked.png"),
         ("Total Charge per Subsystem", "total_charge_per_subsystem.png"),
         ("Current-Voltage Correlation", "current_voltage_correlation.png"),
+        ("Current Slack vs. I_max", "slack_analysis.png"),
+        ("Coincidence Heatmap", "coincidence_heatmap.png"),
+        ("Brownout Contribution Clusters", "brownout_clusters.png"),
+        ("Sensitivity and Recommended Limits", "sensitivity_and_limits.png"),
     ]
     available_battery_figures = [(title, filename) for title, filename in battery_figures if (report_dir / filename).exists()]
+    known_battery_files = {filename for _, filename in available_battery_figures}
+    extra_pngs = sorted(
+        [
+            image_path.name
+            for image_path in report_dir.glob("*.png")
+            if image_path.name not in known_battery_files and image_path.name != "coverage.png"
+        ]
+    )
 
     parts = [
         "<!DOCTYPE html>",
         "<html lang='en'>",
-        "<head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>WPILOG Current Analysis Report</title></head>",
+        "<head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>WPILOG Current Analysis Report</title>",
+        """
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 20px; line-height: 1.3; }
+.tab-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 20px; }
+.tab-button { border: 1px solid #9ca3af; background: #f8fafc; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-weight: 600; }
+.tab-button.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+table { border-collapse: collapse; width: 100%; max-width: 100%; font-size: 13px; }
+th, td { border: 1px solid #d1d5db; padding: 4px 6px; text-align: left; }
+th { background: #f3f4f6; }
+.image-card { margin: 16px 0 22px; }
+.image-card img { max-width: 100%; height: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+</style>
+""",
+        "</head>",
         "<body>",
         "<h1>WPILOG Current Analysis Report</h1>",
         f"<p><b>Log:</b> {html.escape(log_path.name)}</p>",
@@ -653,6 +730,14 @@ def write_html_report(
         + "".join(f"<option value='{metric}'>{metric}</option>" for metric in CURRENT_SUFFIXES)
         + "</select>",
         "</p>",
+        "<div class='tab-bar'>",
+        "<button class='tab-button active' data-tab='phase-plots'>Phase Plots</button>",
+        "<button class='tab-button' data-tab='limits'>Limit Recommendations</button>",
+        "<button class='tab-button' data-tab='battery-plots'>Battery Plots</button>",
+        "<button class='tab-button' data-tab='coverage'>Coverage</button>",
+        "<button class='tab-button' data-tab='tables'>Tables</button>",
+        "</div>",
+        "<div id='phase-plots' class='tab-panel active'>",
     ]
 
     for section in sections:
@@ -672,14 +757,30 @@ def write_html_report(
             ]
         )
 
+    parts.append("</div>")
+    parts.append("<div id='limits' class='tab-panel'>")
+    parts.append("<h2>Limit Recommendations</h2>")
+    if recommendations_df.empty:
+        parts.append("<p>No supply-limit recommendations generated yet.</p>")
+    else:
+        parts.append(
+            dataframe_table_html(
+                recommendations_df,
+                ["subsystem", "current_configured", "p95_observed", "recommended", "delta", "utilization_pct"],
+            )
+        )
+    parts.append("</div>")
+    parts.append("<div id='battery-plots' class='tab-panel'>")
     parts.append("<h2>Battery Analysis Visualizations</h2>")
     if available_battery_figures:
         parts.append("<p>Additional battery-focused plots generated by <code>generate_battery_report(...)</code>.</p>")
         for title, filename in available_battery_figures:
             parts.extend(
                 [
+                    "<div class='image-card'>",
                     f"<h3>{html.escape(title)}</h3>",
                     f"<p><img src='{html.escape(filename)}' alt='{html.escape(title)}' width='980'></p>",
+                    "</div>",
                 ]
             )
     else:
@@ -687,12 +788,28 @@ def write_html_report(
             "<p>No battery-specific visualizations were found in this report directory yet. "
             "Generate them with <code>generate_battery_report(...)</code> and place them in this same folder.</p>"
         )
+    if extra_pngs:
+        parts.append("<h3>Additional Generated PNGs</h3>")
+        parts.append("<p>Auto-discovered images in the report folder not listed in the curated sections.</p>")
+        for filename in extra_pngs:
+            parts.extend(
+                [
+                    "<div class='image-card'>",
+                    f"<h4>{html.escape(filename)}</h4>",
+                    f"<p><img src='{html.escape(filename)}' alt='{html.escape(filename)}' width='980'></p>",
+                    "</div>",
+                ]
+            )
+    parts.append("</div>")
 
     parts.extend(
         [
+            "<div id='coverage' class='tab-panel'>",
             "<h2>Coverage</h2>",
             "<p>Expected signals that were absent from the log.</p>",
             "<p><img src='coverage.png' alt='Topic coverage' width='820'></p>",
+            "</div>",
+            "<div id='tables' class='tab-panel'>",
             "<div class='table-section' data-table-kind='top'>",
             "<h2>Top Rows</h2>",
             "<p>Highest top-bucket rows among direct mechanisms. Filtered by the selectors above.</p>",
@@ -745,8 +862,18 @@ def write_html_report(
                 row_metric_column="metric",
             ),
             "</div>",
+            "</div>",
             """
 <script>
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-button').forEach((button) => {
+    button.classList.toggle('active', button.dataset.tab === tabId);
+  });
+  document.querySelectorAll('.tab-panel').forEach((panel) => {
+    panel.classList.toggle('active', panel.id === tabId);
+  });
+}
+
 function updateSections() {
   const phase = document.getElementById('phaseSelect').value;
   const metric = document.getElementById('metricSelect').value;
@@ -770,9 +897,48 @@ function updateSections() {
     row.hidden = !(phaseMatches && metricMatches);
   });
 }
-document.getElementById('phaseSelect').addEventListener('change', updateSections);
-document.getElementById('metricSelect').addEventListener('change', updateSections);
+
+function parseHashState() {
+  const raw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+  const params = new URLSearchParams(raw);
+  return {
+    phase: params.get('phase'),
+    metric: params.get('metric'),
+    tab: params.get('tab'),
+  };
+}
+
+function writeHashState() {
+  const params = new URLSearchParams();
+  params.set('phase', document.getElementById('phaseSelect').value);
+  params.set('metric', document.getElementById('metricSelect').value);
+  const activeButton = document.querySelector('.tab-button.active');
+  if (activeButton) {
+    params.set('tab', activeButton.dataset.tab);
+  }
+  window.location.hash = params.toString();
+}
+
+document.querySelectorAll('.tab-button').forEach((button) => {
+  button.addEventListener('click', () => {
+    switchTab(button.dataset.tab);
+    writeHashState();
+  });
+});
+document.getElementById('phaseSelect').addEventListener('change', () => {
+  updateSections();
+  writeHashState();
+});
+document.getElementById('metricSelect').addEventListener('change', () => {
+  updateSections();
+  writeHashState();
+});
+const hashState = parseHashState();
+if (hashState.phase) document.getElementById('phaseSelect').value = hashState.phase;
+if (hashState.metric) document.getElementById('metricSelect').value = hashState.metric;
+switchTab(hashState.tab || 'phase-plots');
 updateSections();
+writeHashState();
 </script>
 """,
             "</body></html>",
@@ -784,12 +950,27 @@ updateSections();
     return html_path
 
 
-def generate_report(result: AnalysisResult, report_dir: Path, log_path: Path, csv_path: Path, bucket_count: int) -> Path:
+def generate_report(
+    result: AnalysisResult,
+    report_dir: Path,
+    log_path: Path,
+    csv_path: Path,
+    bucket_count: int,
+    configured_limits: Mapping[str, float] | None = None,
+    threshold: float = 6.8,
+) -> Path:
     df, sections = build_report_assets(result, report_dir, bucket_count)
     battery_inputs = _reconstruct_enabled_battery_inputs(result)
     if battery_inputs is not None:
         time, voltage, subsystem_currents = battery_inputs
-        generate_battery_report(time, voltage, subsystem_currents, report_dir)
+        generate_battery_report(
+            time,
+            voltage,
+            subsystem_currents,
+            report_dir,
+            configured_limits=configured_limits,
+            threshold=threshold,
+        )
     return write_html_report(df, report_dir, log_path, csv_path, sections, bucket_count)
 
 
@@ -840,11 +1021,18 @@ def _battery_plot_style() -> None:
 
 
 def _detect_brownout_events(
-    time: np.ndarray, voltage: np.ndarray, threshold: float = 6.8, merge_gap_s: float = 0.5
-) -> list[tuple[int, int]]:
+    time: np.ndarray,
+    voltage: np.ndarray,
+    threshold: float = 6.8,
+    merge_gap_s: float = 0.5,
+    currents: np.ndarray | None = None,
+    subsystem_names: list[str] | None = None,
+    i_total: np.ndarray | None = None,
+    i_max: float | None = None,
+) -> tuple[list[tuple[int, int]], pd.DataFrame]:
     below = voltage < threshold
     if not np.any(below):
-        return []
+        return [], pd.DataFrame()
 
     transitions = np.diff(below.astype(int))
     starts = list(np.where(transitions == 1)[0] + 1)
@@ -864,7 +1052,41 @@ def _detect_brownout_events(
             merged[-1] = (last_start, end)
         else:
             merged.append((start, end))
-    return merged
+    if currents is None or subsystem_names is None or i_total is None or i_max is None:
+        return merged, pd.DataFrame()
+
+    contribution_rows: list[dict[str, float | int | str]] = []
+    for event_index, (start_idx, end_idx) in enumerate(merged, start=1):
+        if end_idx <= start_idx:
+            continue
+        peak_local = int(np.argmax(i_total[start_idx:end_idx]))
+        peak_idx = start_idx + peak_local
+        total_at_peak = float(i_total[peak_idx])
+        deficit = max(0.0, total_at_peak - i_max)
+        ranked = sorted(
+            [
+                (subsystem, float(currents[sub_idx, peak_idx]))
+                for sub_idx, subsystem in enumerate(subsystem_names)
+            ],
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for rank, (subsystem, current_val) in enumerate(ranked, start=1):
+            contribution_rows.append(
+                {
+                    "event_index": event_index,
+                    "event_start_s": float(time[start_idx]),
+                    "event_end_s": float(time[end_idx - 1]),
+                    "peak_time_s": float(time[peak_idx]),
+                    "min_voltage_v": float(np.min(voltage[start_idx:end_idx])),
+                    "subsystem": subsystem,
+                    "peak_current_a": current_val,
+                    "fraction_of_total": (current_val / total_at_peak) if total_at_peak > 1e-9 else 0.0,
+                    "fraction_of_deficit": (current_val / deficit) if deficit > 1e-9 else math.nan,
+                    "rank": rank,
+                }
+            )
+    return merged, pd.DataFrame(contribution_rows)
 
 
 def _segment_value_at_t(segments: list[tuple[int, int, float]], timestamp: int, cursor: int) -> tuple[float, int]:
@@ -931,6 +1153,9 @@ def generate_battery_report(
     voltage: np.ndarray | list[float],
     subsystem_currents: Mapping[str, np.ndarray | list[float]],
     output_dir: Path | str,
+    configured_limits: Mapping[str, float] | None = None,
+    threshold: float = 6.8,
+    safety_margin: float = 0.05,
 ) -> dict[str, Path]:
     """
     Generate publication-quality battery/current analysis visualizations.
@@ -944,7 +1169,6 @@ def generate_battery_report(
     output_path.mkdir(parents=True, exist_ok=True)
 
     saved: dict[str, Path] = {}
-    threshold = 6.8
 
     # 1) Stacked area of subsystem currents with voltage overlay.
     fig, ax = plt.subplots(figsize=(11.0, 5.5), constrained_layout=True)
@@ -957,7 +1181,9 @@ def generate_battery_report(
 
     ax2 = ax.twinx()
     ax2.plot(t, v, color="black", linewidth=1.5, label="Battery Voltage")
-    ax2.axhline(threshold, color="red", linestyle="--", linewidth=1.2, label="Brownout Threshold (6.8 V)")
+    ax2.axhline(
+        threshold, color="red", linestyle="--", linewidth=1.2, label=f"Brownout Threshold ({threshold:.2f} V)"
+    )
     ax2.set_ylabel("Voltage (V)")
 
     handles_left, labels_left = ax.get_legend_handles_labels()
@@ -999,7 +1225,7 @@ def generate_battery_report(
     saved["subsystem_histograms"] = file_path
 
     # 3) Brownout event isolation windows with merged events.
-    events = _detect_brownout_events(t, v, threshold=threshold, merge_gap_s=0.5)
+    events, _ = _detect_brownout_events(t, v, threshold=threshold, merge_gap_s=0.5)
     if events:
         event_scored = [(start, end, float(np.min(v[start:end]))) for start, end in events]
         event_scored.sort(key=lambda item: item[2])
@@ -1030,7 +1256,9 @@ def generate_battery_report(
     else:
         fig, ax = plt.subplots(figsize=(10.0, 3.5), constrained_layout=True)
         ax.plot(t, v, color="black", linewidth=1.5)
-        ax.axhline(threshold, color="red", linestyle="--", linewidth=1.2, label="Brownout Threshold (6.8 V)")
+        ax.axhline(
+            threshold, color="red", linestyle="--", linewidth=1.2, label=f"Brownout Threshold ({threshold:.2f} V)"
+        )
         ax.set_title("Brownout Event Isolation (No Brownout Events Detected)")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Voltage (V)")
@@ -1185,7 +1413,49 @@ def generate_battery_report(
     plt.close(fig)
     saved["slack_analysis"] = file_path
 
-    # 8) Brownout contribution vectors and clustering.
+    # 8) Brownout peak-frame deficit attribution.
+    events, deficit_contributions = _detect_brownout_events(
+        t,
+        v,
+        threshold=threshold,
+        merge_gap_s=0.5,
+        currents=currents,
+        subsystem_names=subsystems,
+        i_total=i_total,
+        i_max=i_max,
+    )
+    if not deficit_contributions.empty:
+        pivot = (
+            deficit_contributions.pivot(index="event_index", columns="subsystem", values="fraction_of_total")
+            .fillna(0.0)
+            .sort_index()
+        )
+        ordered_cols = sorted(pivot.columns.tolist(), key=lambda name: float(pivot[name].mean()), reverse=True)
+        pivot = pivot[ordered_cols]
+        y_labels = [f"Event {int(event_id)}" for event_id in pivot.index.to_numpy(dtype=int)]
+        fig_height = max(3.8, 0.45 * len(y_labels) + 1.8)
+        fig, ax = plt.subplots(figsize=(11.5, fig_height), constrained_layout=True)
+        left = np.zeros(len(pivot), dtype=float)
+        for subsystem in ordered_cols:
+            vals = pivot[subsystem].to_numpy(dtype=float)
+            ax.barh(y_labels, vals, left=left, color=colors[subsystem], alpha=0.92, label=subsystem)
+            left += vals
+        ax.invert_yaxis()
+        ax.set_xlim(0.0, 1.0)
+        ax.set_xlabel("Fractional Contribution at Peak Frame")
+        ax.set_title("Brownout Deficit Stack by Event")
+        ax.grid(axis="x", linestyle="--", alpha=0.25)
+        ax.legend(loc="lower right", ncol=2, fontsize=8, framealpha=0.9)
+        file_path = output_path / "brownout_deficit_stack.png"
+        fig.savefig(file_path, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        saved["brownout_deficit_stack"] = file_path
+
+        deficit_csv = output_path / "brownout_deficit_contributions.csv"
+        deficit_contributions.sort_values(["event_index", "rank"]).to_csv(deficit_csv, index=False)
+        saved["brownout_deficit_contributions_csv"] = deficit_csv
+
+    # 9) Brownout contribution vectors and clustering.
     contribution_vectors: list[np.ndarray] = []
     for start_idx, end_idx in events:
         if end_idx <= start_idx:
@@ -1279,7 +1549,34 @@ def generate_battery_report(
     plt.close(fig)
     saved["brownout_clusters"] = file_path
 
-    # 9) Sensitivity analysis and recommended limit reductions.
+    # 10) Coincidence matrix (fraction of time both subsystems exceed own P75).
+    total_duration = float(np.sum(dt))
+    p75 = np.array([float(np.percentile(currents[idx], 75)) for idx in range(len(subsystems))], dtype=float)
+    coincidence = np.zeros((len(subsystems), len(subsystems)), dtype=float)
+    if total_duration > 0.0:
+        above = currents[:, :-1] >= p75[:, None]
+        for i in range(len(subsystems)):
+            for j in range(len(subsystems)):
+                mask = above[i] & above[j]
+                coincidence[i, j] = float(np.sum(dt[mask]) / total_duration)
+    coincidence_df = pd.DataFrame(coincidence, index=subsystems, columns=subsystems)
+    coincidence_csv = output_path / "coincidence_matrix.csv"
+    coincidence_df.to_csv(coincidence_csv)
+    saved["coincidence_matrix_csv"] = coincidence_csv
+
+    fig_size = max(5.8, 0.42 * len(subsystems) + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size), constrained_layout=True)
+    image = ax.imshow(coincidence, vmin=0.0, vmax=1.0, cmap="viridis", aspect="auto")
+    ax.set_xticks(range(len(subsystems)), subsystems, rotation=45, ha="right")
+    ax.set_yticks(range(len(subsystems)), subsystems)
+    ax.set_title("Coincidence Matrix: Time Both > P75")
+    fig.colorbar(image, ax=ax, label="Coincidence Fraction")
+    file_path = output_path / "coincidence_heatmap.png"
+    fig.savefig(file_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    saved["coincidence_heatmap"] = file_path
+
+    # 11) Sensitivity analysis and recommended limit reductions.
     p95 = np.array([float(np.percentile(currents[idx], 95)) for idx in range(len(subsystems))], dtype=float)
     low_slack_mask = slack < (0.1 * i_max)
     low_slack_count = int(np.sum(low_slack_mask))
@@ -1289,26 +1586,35 @@ def generate_battery_report(
             near_p95 = currents[idx] > (0.9 * p95[idx])
             sensitivities[idx] = float(np.mean(near_p95[low_slack_mask]))
 
-    recommended_limits = p95.copy()
+    configured = {name: float(value) for name, value in (configured_limits or {}).items()}
+    base_limits = np.array([configured.get(subsystem, p95[idx]) for idx, subsystem in enumerate(subsystems)], dtype=float)
+    recommended_limits = base_limits.copy()
     reduction_order = list(np.argsort(sensitivities)[::-1])
-    if float(np.sum(recommended_limits)) > i_max:
-        while float(np.sum(recommended_limits)) > i_max:
-            progressed = False
-            for idx in reduction_order:
-                if recommended_limits[idx] > 5.0:
-                    next_limit = max(5.0, recommended_limits[idx] - 1.0)
-                    if next_limit < recommended_limits[idx]:
-                        recommended_limits[idx] = next_limit
-                        progressed = True
-                        if float(np.sum(recommended_limits)) <= i_max:
-                            break
-            if not progressed:
+    target_total = i_max * max(0.0, 1.0 - safety_margin)
+    if float(np.sum(recommended_limits)) > target_total:
+        for idx in reduction_order:
+            other_sum = float(np.sum(recommended_limits)) - float(recommended_limits[idx])
+            if other_sum + float(recommended_limits[idx]) <= target_total:
+                continue
+            if other_sum + 5.0 > target_total:
+                recommended_limits[idx] = 5.0
+                continue
+            low, high = 5.0, float(recommended_limits[idx])
+            while high - low > 0.01:
+                mid = 0.5 * (low + high)
+                if other_sum + mid <= target_total:
+                    low = mid
+                else:
+                    high = mid
+            recommended_limits[idx] = max(5.0, low)
+            if float(np.sum(recommended_limits)) <= target_total:
                 break
 
     sensitivity_order = np.argsort(sensitivities)[::-1]
     ordered_subsystems = [subsystems[idx] for idx in sensitivity_order]
     ordered_sensitivities = sensitivities[sensitivity_order]
     ordered_p95 = p95[sensitivity_order]
+    ordered_configured = base_limits[sensitivity_order]
     ordered_limits = recommended_limits[sensitivity_order]
 
     fig_height = max(4.6, 0.42 * len(subsystems) + 2.2)
@@ -1326,7 +1632,7 @@ def generate_battery_report(
     ax_left.grid(axis="x", linestyle="--", alpha=0.3)
 
     bar_h = 0.38
-    ax_right.barh(y_pos - bar_h / 2.0, ordered_p95, height=bar_h, color="#94a3b8", alpha=0.92, label="P95")
+    ax_right.barh(y_pos - bar_h / 2.0, ordered_configured, height=bar_h, color="#94a3b8", alpha=0.92, label="Configured/P95")
     ax_right.barh(
         y_pos + bar_h / 2.0,
         ordered_limits,
@@ -1339,14 +1645,17 @@ def generate_battery_report(
     ax_right.set_yticklabels(ordered_subsystems)
     ax_right.invert_yaxis()
     ax_right.set_xlabel("Current Limit (A)")
-    ax_right.set_title("P95 vs. Recommended Limit")
+    ax_right.set_title("Configured/P95 vs. Recommended Supply Limit")
     ax_right.grid(axis="x", linestyle="--", alpha=0.3)
     ax_right.legend(loc="lower right")
-    limit_max = max(float(np.max(ordered_p95)) if ordered_p95.size else 0.0, float(np.max(ordered_limits)) if ordered_limits.size else 0.0)
+    limit_max = max(
+        float(np.max(ordered_configured)) if ordered_configured.size else 0.0,
+        float(np.max(ordered_limits)) if ordered_limits.size else 0.0,
+    )
     text_dx = max(0.35, limit_max * 0.01)
-    for pos, p95_val, limit_val in zip(y_pos, ordered_p95, ordered_limits):
-        if limit_val < p95_val:
-            delta = p95_val - limit_val
+    for pos, cfg_val, limit_val in zip(y_pos, ordered_configured, ordered_limits):
+        if limit_val < cfg_val:
+            delta = cfg_val - limit_val
             ax_right.text(limit_val + text_dx, pos + bar_h / 2.0, f"-{delta:.1f} A", va="center", ha="left", fontsize=9)
 
     fig.suptitle("Subsystem Sensitivity and Recommended Current Limits")
@@ -1354,6 +1663,28 @@ def generate_battery_report(
     fig.savefig(file_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     saved["sensitivity_and_limits"] = file_path
+
+    recommendation_rows: list[dict[str, float | str]] = []
+    for idx, subsystem in enumerate(subsystems):
+        configured_limit = configured.get(subsystem, p95[idx])
+        utilization_pct = (100.0 * p95[idx] / configured_limit) if configured_limit > 1e-9 else math.nan
+        recommendation_rows.append(
+            {
+                "subsystem": subsystem,
+                "limit_type": "supply",
+                "current_configured": configured_limit,
+                "p95_observed": p95[idx],
+                "recommended": recommended_limits[idx],
+                "delta": recommended_limits[idx] - configured_limit,
+                "utilization_pct": utilization_pct,
+                "headroom_A": configured_limit - p95[idx],
+                "sensitivity": sensitivities[idx],
+            }
+        )
+    recommendation_df = pd.DataFrame(recommendation_rows).sort_values("sensitivity", ascending=False)
+    recommendation_csv = output_path / "limit_recommendations_supply.csv"
+    recommendation_df.to_csv(recommendation_csv, index=False)
+    saved["limit_recommendations_supply_csv"] = recommendation_csv
 
     # Plain-text report for quick CLI inspection.
     print(f"Battery fit: V_oc={v_oc:.3f} V, R_int={r_int:.4f} ohm, I_max={i_max:.2f} A")
@@ -1377,6 +1708,47 @@ def generate_battery_report(
         )
 
     return saved
+
+
+def parse_configured_limits(raw_limits: str | None) -> dict[str, float]:
+    if not raw_limits:
+        return {}
+    raw_limits = raw_limits.strip()
+    path_candidate = Path(raw_limits)
+    if path_candidate.exists():
+        df = pd.read_csv(path_candidate)
+        if "subsystem" in df.columns and "limit" in df.columns:
+            return {str(row["subsystem"]): float(row["limit"]) for _, row in df.iterrows()}
+        if len(df.columns) >= 2:
+            subsystem_col, limit_col = df.columns[0], df.columns[1]
+            return {str(row[subsystem_col]): float(row[limit_col]) for _, row in df.iterrows()}
+        raise ValueError("limits CSV must contain at least two columns (subsystem, limit)")
+
+    limits: dict[str, float] = {}
+    for part in raw_limits.split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        if "=" not in piece:
+            raise ValueError(f"Invalid --limits token {piece!r}; expected KEY=VALUE")
+        key, value_text = piece.split("=", 1)
+        limits[key.strip()] = float(value_text.strip())
+    return limits
+
+
+def print_limit_recommendations(report_dir: Path) -> None:
+    path = report_dir / "limit_recommendations_supply.csv"
+    if not path.exists():
+        return
+    df = pd.read_csv(path).sort_values("sensitivity", ascending=False)
+    if df.empty:
+        return
+    print("\nSupply limit recommendations:")
+    print(
+        df[["subsystem", "current_configured", "p95_observed", "recommended", "delta", "utilization_pct"]].to_string(
+            index=False, float_format=lambda value: f"{value:.2f}"
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1409,6 +1781,17 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="How many current buckets to split enabled/auto/teleop time into. Default: 4.",
     )
+    parser.add_argument(
+        "--limits",
+        type=str,
+        help="Configured subsystem limits as CSV path or comma-separated KEY=VALUE pairs.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=6.8,
+        help="Brownout voltage threshold in volts. Default: 6.8.",
+    )
     args = parser.parse_args()
     if args.quantiles < 2:
         parser.error("--quantiles must be at least 2")
@@ -1430,14 +1813,24 @@ def main() -> None:
         if args.report_dir
         else default_base_dir / "report"
     )
+    configured_limits = parse_configured_limits(args.limits)
 
     result = analyze_log(log_path, args.quantiles)
     write_csv(result.rows, output_path)
     print(output_path)
 
     if not args.no_report:
-        html_path = generate_report(result, report_dir, log_path, output_path, args.quantiles)
+        html_path = generate_report(
+            result,
+            report_dir,
+            log_path,
+            output_path,
+            args.quantiles,
+            configured_limits=configured_limits,
+            threshold=args.threshold,
+        )
         print(html_path)
+        print_limit_recommendations(report_dir)
 
 
 if __name__ == "__main__":
