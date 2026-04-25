@@ -1358,12 +1358,22 @@ def generate_battery_report(
     # Plain-text report for quick CLI inspection.
     print(f"Battery fit: V_oc={v_oc:.3f} V, R_int={r_int:.4f} ohm, I_max={i_max:.2f} A")
     print(f"Brownout rate: {brownout_rate:.4f}")
-    print("Subsystem | P95 (A) | sensitivity | recommended limit (A) | delta (A)")
+    name_w = max(len("Subsystem"), max((len(name) for name in subsystems), default=0))
+    p95_w = len("P95 (A)")
+    sens_w = len("Sensitivity")
+    rec_w = len("Recommended (A)")
+    delta_w = len("Delta (A)")
+    header = (
+        f"{'Subsystem':<{name_w}} | {'P95 (A)':>{p95_w}} | {'Sensitivity':>{sens_w}} | "
+        f"{'Recommended (A)':>{rec_w}} | {'Delta (A)':>{delta_w}}"
+    )
+    print(header)
+    print("-" * len(header))
     for idx in sensitivity_order:
         delta_val = p95[idx] - recommended_limits[idx]
         print(
-            f"{subsystems[idx]} | {p95[idx]:.2f} | {sensitivities[idx]:.3f} | "
-            f"{recommended_limits[idx]:.2f} | {delta_val:.2f}"
+            f"{subsystems[idx]:<{name_w}} | {p95[idx]:>{p95_w}.2f} | {sensitivities[idx]:>{sens_w}.3f} | "
+            f"{recommended_limits[idx]:>{rec_w}.2f} | {delta_val:>{delta_w}.2f}"
         )
 
     return saved
